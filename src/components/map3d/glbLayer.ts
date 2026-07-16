@@ -51,16 +51,25 @@ export function addGlbLayer(
   let boxHelper: THREE.BoxHelper | null = null;
   // Ma trận chiếu (model space → clip) của frame gần nhất, dùng cho hit-test
   const lastProj = new THREE.Matrix4();
+  const projMat = new THREE.Matrix4();
   let hasProj = false;
 
-  // Ma trận đặt model vào mercator (giống trong render, không gồm projection)
+  // Ma trận đặt model vào mercator — chỉ tính lại khi vị trí/scale/xoay đổi,
+  // render mỗi frame dùng lại bản cache thay vì cấp phát Matrix4 mới
+  const localMat = new THREE.Matrix4();
+  const tmpRot = new THREE.Matrix4();
+  let localDirty = true;
   const localMatrix = () => {
-    const meterScale = merc.meterInMercatorCoordinateUnits() * scale * baseScale;
-    return new THREE.Matrix4()
-      .makeTranslation(merc.x, merc.y, merc.z)
-      .scale(new THREE.Vector3(meterScale, -meterScale, meterScale))
-      .multiply(new THREE.Matrix4().makeRotationZ((rotationDeg * Math.PI) / 180))
-      .multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2 + (tiltDeg * Math.PI) / 180));
+    if (localDirty) {
+      const meterScale = merc.meterInMercatorCoordinateUnits() * scale * baseScale;
+      localMat
+        .makeTranslation(merc.x, merc.y, merc.z)
+        .scale(new THREE.Vector3(meterScale, -meterScale, meterScale))
+        .multiply(tmpRot.makeRotationZ((rotationDeg * Math.PI) / 180))
+        .multiply(tmpRot.makeRotationX(Math.PI / 2 + (tiltDeg * Math.PI) / 180));
+      localDirty = false;
+    }
+    return localMat;
   };
 
   const layer: maplibregl.CustomLayerInterface = {
@@ -84,6 +93,7 @@ export function addGlbLayer(
           .getSize(new THREE.Vector3());
         const maxDim = Math.max(size.x, size.y, size.z);
         if (maxDim > 0) baseScale = 30 / maxDim;
+        localDirty = true;
         scene.add(gltf.scene);
         mapInstance.triggerRepaint();
       });
@@ -97,19 +107,34 @@ export function addGlbLayer(
     },
     render(_gl, matrix) {
       if (!renderer) return;
-      const m = new THREE.Matrix4().fromArray(
+      // Dùng lại projMat mỗi frame thay vì cấp phát Matrix4 mới
+      projMat.fromArray(
         (matrix as unknown as { defaultProjectionData?: { mainMatrix: number[] } })
           .defaultProjectionData?.mainMatrix ?? (matrix as unknown as number[]),
       );
-      camera.projectionMatrix = m.multiply(localMatrix());
+      camera.projectionMatrix = projMat.multiply(localMatrix());
       lastProj.copy(camera.projectionMatrix);
       hasProj = true;
       renderer.resetState();
       renderer.render(scene, camera);
     },
     onRemove() {
+      // Giải phóng GPU memory của model (geometry/material/texture)
+      scene?.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((mat) => {
+          if (!mat) return;
+          Object.values(mat).forEach((v) => {
+            if (v instanceof THREE.Texture) v.dispose();
+          });
+          mat.dispose();
+        });
+      });
       renderer?.dispose();
       renderer = null;
+      modelScene = null;
     },
   };
 
@@ -122,19 +147,23 @@ export function addGlbLayer(
     },
     setScale: (s) => {
       scale = s;
+      localDirty = true;
       map.triggerRepaint();
     },
     setRotation: (deg) => {
       rotationDeg = deg;
+      localDirty = true;
       map.triggerRepaint();
     },
     setTilt: (deg) => {
       tiltDeg = deg;
+      localDirty = true;
       map.triggerRepaint();
     },
     setPosition: (p) => {
       position = p;
       merc = maplibregl.MercatorCoordinate.fromLngLat({ lng: p[0], lat: p[1] }, 0);
+      localDirty = true;
       map.triggerRepaint();
     },
     getPosition: () => position,
